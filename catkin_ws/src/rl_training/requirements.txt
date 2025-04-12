@@ -1,0 +1,5 @@
+pyaml==25.1.0
+rospkg==1.6.0
+numpy==2.2.4
+gymnasium==1.1.1
+stable_baselines3==2.6.0
