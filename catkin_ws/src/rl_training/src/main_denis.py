@@ -18,6 +18,7 @@ from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan, Image
 from gazebo_msgs.msg import ModelState
 from gazebo_msgs.srv import GetModelState, SetModelState
+from std_srvs.srv import Empty
 
 from std_msgs.msg import Float32, Int32
 
@@ -66,6 +67,10 @@ class TrainingEnv(gym.Env):
         get_model_state = rospy.ServiceProxy('/gazebo/get_model_state', GetModelState)
         model_state = get_model_state("turtlebot3", "world")
 
+        # Reset Gazebo and odometry
+        rospy.wait_for_service('/gazebo/reset_world')
+        self.reset_world = rospy.ServiceProxy('/gazebo/reset_world', Empty)
+
         self.initial_state = ModelState()
         self.initial_state.model_name = "turtlebot3"
         self.initial_state.pose = model_state.pose
@@ -90,7 +95,7 @@ class TrainingEnv(gym.Env):
         self.goal_threshold = 0.5
 
         #Waypoints
-        self.waypoint = [[8.419438, 8.847774]]
+        self.waypoint = [[8.009294, 7.972296], [6.511956, 6.144635], [6.313862, 2.227839], [9.039780, -5.957927], [1.315660, -8.974951]]
 
         # ROS Movement Publisher
         self.pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
@@ -176,23 +181,29 @@ class TrainingEnv(gym.Env):
             # Stop the robot before resetting
             self.pub.publish(Twist())
 
-            reward = -20
-            # rospy.loginfo(f"[Reward] Collision: {-100}")
+            reward = -200
 
             return obvs, reward, True, False, info
+        
 
         # Get velocity from the action
         linear_velocity, angular_velocity = action
 
         # Positive reward for moving
-        linear_reward = 2 * linear_velocity
+        linear_reward = 30 * linear_velocity
         reward = linear_reward
-        rospy.loginfo(f"[Reward] Linear reward: {linear_reward:.2f}")
+        rospy.loginfo("Nuevo reward info")
+
+        rospy.loginfo("Linear_reward = " + str(linear_reward))
 
         # Penalize angular velocity
-        angular_penalty = -2 * abs(angular_velocity)
+        angular_penalty = -15 * abs(angular_velocity)
         reward += angular_penalty
-        rospy.loginfo(f"[Reward] Angular penalty: {angular_penalty:.2f}")
+
+        rospy.loginfo("Angular penalty = " + str(angular_penalty))
+
+        """aprox_distance_pen = sum(map(lambda x: x < 0.4, self.lidar))
+        reward -= aprox_distance_pen * 10"""
 
         # Calculate distance traveled since last reward
         if self.odom is not None:
@@ -204,7 +215,7 @@ class TrainingEnv(gym.Env):
             # Give reward for travelled distance
             travelled_reward = euclidean * 10
             reward += travelled_reward
-            rospy.loginfo(f"[Reward] Step distance travelled: {travelled_reward:.2f}")
+            rospy.loginfo("travelled_reward = " + str(travelled_reward))
 
             # Give reward for getting closer to the waypoint
             waypoint_distance = np.linalg.norm(self.odom[:2] - self.waypoint[0])
@@ -213,23 +224,17 @@ class TrainingEnv(gym.Env):
                 wp = self.waypoint.pop(0)
                 self.waypoint.append(wp)
             else:
-                waypoint_reward = waypoint_distance * 10
+                waypoint_reward = -0.5 * waypoint_distance
             
             reward += waypoint_reward
+
+            rospy.loginfo("waypoint_reward = " + str(waypoint_reward))
 
             # Reset step pose
             self.last_odom = self.odom.copy()
 
         # Reset step time
         self.last_distance_reward_time = time.time()
-
-        # Add angular velocity to the total sum
-        self.angular_velocity_sum += angular_velocity
-        rospy.loginfo(f"[Info] Angular-sum: {self.angular_velocity_sum:.2f}")
-
-        # Penalize long angular movements
-        reward -= abs(self.angular_velocity_sum) * 10
-        rospy.loginfo(f"[Reward] Angular-sum penalty: {-abs(self.angular_velocity_sum) * 5:.2f}")
 
         # Add reward to the total episode reward
         self.episode_reward += reward
@@ -244,13 +249,22 @@ class TrainingEnv(gym.Env):
         terminated = False
         truncated = False
 
-        rospy.loginfo(f"[Info] Step reward: {reward}")
 
         # Return step
         return obvs, reward, terminated, truncated, info
 
     def reset(self, seed=42):
         super().reset()
+
+        rospy.loginfo("Reset env: total_reward=%.2f", self.episode_reward)
+
+        # Reset Gazebo
+        try:
+            self.reset_world()
+            rospy.loginfo("Se ha reseteado Gazebo")
+        except rospy.ServiceException as e:
+            rospy.logwarn(f"Error al resetear Gazebo: {e}")
+        rospy.sleep(0.1)
 
         # Reset to initial position
         rospy.wait_for_service('/gazebo/set_model_state')
@@ -273,6 +287,7 @@ class TrainingEnv(gym.Env):
 
         # Reset sum of angular velocity and reward times
         self.angular_velocity_sum = 0.0
+        
 
         # wait for valid odom
         while self.odom is None:
