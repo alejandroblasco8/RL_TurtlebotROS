@@ -1,75 +1,162 @@
 #!/usr/bin/env python3
-import rospy
-import time
+
 import math
-import gymnasium as gym
-from gymnasium import spaces
-from nav_msgs.msg import Odometry
-from sensor_msgs.msg import LaserScan
-from geometry_msgs.msg import Twist
-from gazebo_msgs.srv import SetModelState, GetModelState
-from gazebo_msgs.msg import ModelState
+import time
+
 import numpy as np
+
+import gymnasium as gym
 from stable_baselines3 import SAC
-from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.env_checker import check_env
+
+from cv_bridge import CvBridge
+import cv2
+
+import rospy
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import LaserScan
+from gazebo_msgs.msg import ModelState
+from gazebo_msgs.srv import GetModelState, SetModelState
+from std_srvs.srv import Empty
+
 from std_msgs.msg import Float32, Int32
 
-class WaypointEnv(gym.Env):
-    metadata = {"render.modes": []}
-
+class TrainingEnv(gym.Env):
     def __init__(self):
-        super().__init__()
-        # single waypoint
-        self.waypoint = np.array([8.419438, 8.847774], dtype=np.float32)
-        self.goal_threshold = 0.5  # meters
-        # collision threshold and temporal confirmation
-        self.collision_threshold = 0.12
-        self.collision_confirm_steps = 3
-        self._collision_counter = 0
-        # sectorization of LiDAR
-        self.num_sectors = 16
-
-        # get first scan to determine raw size
-        first_scan = rospy.wait_for_message('/scan', LaserScan)
-        self.raw_size = len(first_scan.ranges)
-
-        # action & observation spaces
-        low_action = np.array([0.0, -1.0], dtype=np.float32)
-        high_action = np.array([1.0,  1.0], dtype=np.float32)
-        self.action_space = spaces.Box(low=low_action, high=high_action, dtype=np.float32)
-        obs_dim = 3 + self.num_sectors
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
+        # Action space: Linear velocity and angular velocity
+        self.action_space = gym.spaces.Box(
+            low=np.array([0.0, -1.82]),
+            high=np.array([0.26, 1.82]),
+            dtype=np.float32
         )
 
-        # ROS pubs/subs
-        self.cmd_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
-        rospy.Subscriber('/odom', Odometry, self._odom_cb)
-        rospy.Subscriber('/scan', LaserScan, self._scan_cb)
-        # Publishers for real-time monitoring
-        self.step_reward_pub = rospy.Publisher('/rl/step_reward', Float32, queue_size=1)
-        self.episode_reward_pub = rospy.Publisher('/rl/episode_reward', Float32, queue_size=1)
-        self.episode_length_pub = rospy.Publisher('/rl/episode_length', Int32, queue_size=1)
+        #LiDAR num sectors
+        self.num_sectors = 16
 
-        # internal state
-        self.odom = None
-        self.raw_scan = np.zeros(self.raw_size, dtype=np.float32)
-        self.scan = np.zeros(self.num_sectors, dtype=np.float32)
-        self.last_odom = None
-        self._last_v = 0.0
-        self._last_a = 0.0
-        self.episode_reward = 0.0
-        self.episode_length = 0
+        # Observation space: LIDAR + IMAGE
+        self.observation_space = gym.spaces.Dict({
+            "lidar": gym.spaces.Box(
+                low=0.0,
+                high=10.0,
+                shape=(self.num_sectors,),
+                dtype=np.float32
+            ),
+            "odom": gym.spaces.Box(
+                low=np.array([-np.inf, -np.inf, -math.pi], dtype=np.float32),
+                high=np.array([ np.inf,  np.inf,  math.pi], dtype=np.float32),
+                shape=(3,),
+                dtype=np.float32
+            )
+        })
 
-        # Gazebo reset
+        self.lidar = np.zeros(360, dtype=np.float32)
+
+        # Initial state: Position
         rospy.wait_for_service('/gazebo/get_model_state')
-        get_state = rospy.ServiceProxy('/gazebo/get_model_state', GetModelState)
-        ms = get_state('turtlebot3', 'world')
-        self.initial_state = ModelState(model_name='turtlebot3', pose=ms.pose, twist=ms.twist, reference_frame='world')
-        rospy.wait_for_service('/gazebo/set_model_state')
-        self.set_state_srv = rospy.ServiceProxy('/gazebo/set_model_state', SetModelState)
+        get_model_state = rospy.ServiceProxy('/gazebo/get_model_state', GetModelState)
+        model_state = get_model_state("turtlebot3", "world")
 
-    def _odom_cb(self, msg):
+        # Reset Gazebo and odometry
+        rospy.wait_for_service('/gazebo/reset_world')
+        self.reset_world = rospy.ServiceProxy('/gazebo/reset_world', Empty)
+
+        self.initial_state = ModelState()
+        self.initial_state.model_name = "turtlebot3"
+        self.initial_state.pose = model_state.pose
+        self.initial_state.twist.linear.x = 0.0
+        self.initial_state.twist.linear.y = 0.0
+        self.initial_state.twist.linear.z = 0.0
+        self.initial_state.twist.angular.x = 0.0
+        self.initial_state.twist.angular.y = 0.0
+        self.initial_state.twist.angular.z = 0.0
+        self.initial_state.reference_frame = "world"
+
+        # Collision LIDAR threshold
+        self.collision_threshold = 0.12
+
+        # Collision counter
+        self._collision_counter = 0
+
+        # Confirm collision number
+        self.collision_confirm_steps = 3
+
+        # LiDAR threshold
+        self.lidar_threshold = 0.7
+
+        # Dist left and right
+        self.lidar_left = 10
+        self.lidar_right= 10
+
+        # Waypoint threshold
+        self.goal_threshold = 0.5
+
+        # Dist waypoint threshold
+        self.dist_epsilon = 0.5
+
+        # Last waypoint reward
+        self.last_waypoint_reward = 0
+
+        # Waypoints
+        self.waypoint = [[-2.737936, 8.929284], [4.558541, 9.021430],[8.009294, 7.972296], [6.511956, 6.144635], [8.442575, 4.045553], [6.313862, 2.227839], [9.039780, -5.957927], [1.315660, -8.974951], [-6.588877, -9.004139], [-8.894380, -5.594486], [-6.242726, -1.863769], [-2.014763, -3.952699], [2.206598, -0.400605], [-0.313865, 1.972752], [-6.928076, 2.018310], [-8.195169, 8.364141]]
+
+        # ROS Movement Publisher
+        self.pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
+        self.rate = rospy.Rate(10)
+
+        # ROS LIDAR Subscriber
+        rospy.Subscriber("/scan", LaserScan, self._laser_callback)
+
+        # ROS Odometry Subscriber
+        rospy.Subscriber('/odom', Odometry, self._odom_callback)
+
+        # Reward publisher
+        self.episode_reward_pub = rospy.Publisher('/rl/episode_reward', Float32, queue_size=1)
+        self.episode_reward = 0.0
+
+        # Distance travelled threshold to get reward
+        self.distance_travelled_threshold = 0.5
+
+        # Last distance reward time
+        self.last_distance_reward_time = time.time()
+
+        # Odom
+        self.odom = None
+        self.last_odom = [model_state.pose.position.x, model_state.pose.position.y]
+
+        # Sum of angular velocity
+        self.angular_velocity_sum = 0.0
+
+        # Collision timer
+        self.last_moved_time = time.time()
+        self.last_moved_position = None
+
+    def _laser_callback(self, msg):
+        # filter invalid
+        raw = np.array([r if (not math.isinf(r) and not math.isnan(r) and r<3.5) else 10.0 for r in msg.ranges], dtype=np.float32)
+        self.raw_scan = raw
+        # sectorize
+        sectors = np.array_split(raw, self.num_sectors)
+        self.lidar = np.array([np.min(s) for s in sectors], dtype=np.float32)
+        self.lidar_left, self.lidar_right = self.get_dist(raw)
+
+    def get_dist(self, raw):
+        N = len(raw)
+        deg2idx = lambda deg: int(deg * N / 360.0)
+
+        li, lf = deg2idx(70),  deg2idx(110)
+        ri, rf = deg2idx(250), deg2idx(290)
+
+        left_vals  = raw[li: lf+1]
+        right_vals = raw[ri: rf+1]
+
+        lidar_left  = float(np.max(left_vals))   if left_vals.size  > 0 else float('inf')
+        lidar_right = float(np.max(right_vals))  if right_vals.size > 0 else float('inf')
+
+        return lidar_left, lidar_right
+        
+    
+    def _odom_callback(self, msg):
         p = msg.pose.pose.position
         o = msg.pose.pose.orientation
         siny = 2*(o.w*o.z + o.x*o.y)
@@ -77,104 +164,191 @@ class WaypointEnv(gym.Env):
         yaw = math.atan2(siny, cosy)
         self.odom = np.array([p.x, p.y, yaw], dtype=np.float32)
 
-    def _scan_cb(self, msg):
-        # filter invalid
-        raw = np.array([r if (not math.isinf(r) and not math.isnan(r) and r<3.5) else 10.0 for r in msg.ranges], dtype=np.float32)
-        self.raw_scan = raw
-        # sectorize
-        sectors = np.array_split(raw, self.num_sectors)
-        self.scan = np.array([np.min(s) for s in sectors], dtype=np.float32)
+    def _has_collisioned(self):
+        if self.odom is not None and self.last_moved_position is not None:
+            dist = np.linalg.norm(self.odom[:2] - self.last_moved_position)
+            if dist > 0.05:
+                self.last_moved_time = time.time()
+                self.last_moved_position = self.odom[:2]
+            else:
+                if time.time() - self.last_moved_time > 3.0:
+                    rospy.loginfo("Last_moved_pos = " + str(self.last_moved_position) + ", Actual pos = " + str(self.odom[:2]))
+                    return True
+        return False
 
     def _get_obs(self):
-        return np.concatenate([self.odom, self.scan])
+        return {
+            "lidar": self.lidar.copy(),
+            "odom" : self.odom.copy()
+        }
+
+    def _get_info(self):
+        return {}
+
+    def step(self, action):
+        # Get observations and extra information
+        obvs = self._get_obs()
+        info = self._get_info()
+
+        if self._has_collisioned():
+            # Stop the robot before resetting
+            self.pub.publish(Twist())
+
+            reward = -300
+
+            return obvs, reward, True, False, info
+        
+
+        # Get velocity from the action
+        linear_velocity, angular_velocity = action
+
+        
+        if(self.lidar_left == 10.0 and self.lidar_right == 10.0):
+            reward = -50
+        else:
+            dist_diff = abs(self.lidar_left - self.lidar_right)
+            reward = -dist_diff*2.5
+
+        rospy.loginfo("Dist_reward = " + str(reward))
+        rospy.loginfo("Distancias: " + str(self.lidar_left) + "," + str(self.lidar_right))
+
+        # Penalize angular velocity
+        angular_penalty = -10 * abs(angular_velocity)
+        reward += angular_penalty
+
+        rospy.loginfo("Angular penalty = " + str(angular_penalty))
+
+        # Calculate distance traveled since last reward
+        if self.odom is not None:
+            euclidean = math.sqrt(
+            (self.odom[0] - self.last_odom[0]) ** 2
+            + (self.odom[1] - self.last_odom[1]) ** 2
+            )
+
+            # Give reward for travelled distance
+            travelled_reward = euclidean * 20
+            reward += travelled_reward
+            rospy.loginfo("travelled_reward = " + str(travelled_reward))
+            first_wp = np.array(self.waypoint[0], dtype=np.float32)
+            last_wp = np.array(self.waypoint[-1], dtype=np.float32)
+            dist_first = np.linalg.norm(self.odom[:2] - first_wp)
+            dist_last = np.linalg.norm(self.odom[:2] - last_wp)
+            k_fl = 0.5
+            """if dist_first < dist_last:
+                lr_reward = k_fl * dist_last
+            else:
+                lr_reward = -k_fl * dist_first
+            reward += lr_reward
+            rospy.loginfo(f"First vs Last WP reward: {lr_reward:.2f}")"""
+
+            # Give reward for getting closer to the waypoint
+            waypoint_reward = 1/(dist_first + self.dist_epsilon) * 10 + self.last_waypoint_reward
+            if dist_first < self.goal_threshold:
+                wp = self.waypoint.pop(0)
+                self.waypoint.append(wp)
+                self.last_waypoint_reward = waypoint_reward
+
+            reward += waypoint_reward
+
+            rospy.loginfo("waypoint_reward = " + str(waypoint_reward))
+
+            # Reset step pose
+            self.last_odom = self.odom.copy()
+
+        # Reset step time
+        self.last_distance_reward_time = time.time()
+
+        # Add reward to the total episode reward
+        self.episode_reward += reward
+
+        # Send control ROS message
+        msg = Twist()
+        msg.linear.x = linear_velocity
+        msg.angular.z = angular_velocity
+        self.pub.publish(msg)
+
+        # Terminated & Truncated
+        terminated = False
+        truncated = False
+
+
+        # Return step
+        return obvs, reward, terminated, truncated, info
 
     def reset(self, seed=42):
         super().reset()
-        # publish episode summary
-        self.episode_reward_pub.publish(self.episode_reward)
-        self.episode_length_pub.publish(self.episode_length)
-        rospy.loginfo("Reset env: total_reward=%.2f, length=%d", self.episode_reward, self.episode_length)
-        # reset gazebo
-        self.set_state_srv(self.initial_state)
-        time.sleep(0.2)
-        # reset counters
-        self.last_odom = None
-        self._last_v = self._last_a = 0.0
-        self._collision_counter = 0
-        self.episode_reward = 0.0
-        self.episode_length = 0
-        # wait for valid
-        while self.odom is None:
-            rospy.sleep(0.01)
-        return self._get_obs(), {}
 
-    def step(self, action):
-        # send command
-        cmd = Twist(); cmd.linear.x, cmd.angular.z = action
-        self.cmd_pub.publish(cmd)
+        rospy.loginfo("Reset env: total_reward=%.2f", self.episode_reward)
+
+        # Reset Gazebo
+        try:
+            self.reset_world()
+            rospy.loginfo("Se ha reseteado Gazebo")
+        except rospy.ServiceException as e:
+            rospy.logwarn(f"Error al resetear Gazebo: {e}")
         rospy.sleep(0.1)
 
-        obs = self._get_obs()
-        rospy.loginfo("LiDAR sectors@step %d: %s",
-                self.episode_length,
-                np.round(self.scan, 3).tolist())
-        # compute reward with boosting
-        # progress reward scaled
-        if self.last_odom is None:
-            r_prog = 0.0
-        else:
-            prev_d = np.linalg.norm(self.last_odom[:2] - self.waypoint)
-            curr_d = np.linalg.norm(obs[:2] - self.waypoint)
-            r_prog = (prev_d - curr_d) * 20.0
-        # speed bonus
-        v = action[0]
-        r_speed = 0.05 * v
-        # angular penalty
-        r_ang = -0.1 * abs(action[1])
-        # centering
-        left = np.mean(self.scan[:self.num_sectors//2])
-        right = np.mean(self.scan[self.num_sectors//2:])
-        r_center = -0.5 * abs(left - right)
-        # obstacle proximity penalty
-        r_obs = -1.0 * max(0.0, 0.2 - np.min(self.scan))
-        reward = r_prog + r_speed + r_ang + r_center + r_obs
+        # Reset to initial position
+        rospy.wait_for_service('/gazebo/set_model_state')
+        set_model_state = rospy.ServiceProxy('/gazebo/set_model_state', SetModelState)
+        set_model_state(self.initial_state)
 
-        # update episode metrics
-        self.episode_reward += reward
-        self.episode_length += 1
-        self.step_reward_pub.publish(reward)
+        # zero lidar and image
+        self.lidar = np.zeros(self.num_sectors, dtype=np.float32)
 
-        # check done
-        done = False
-        if np.min(self.scan) <= self.collision_threshold:
-            self._collision_counter += 1
-        else:
-            self._collision_counter = 0
-        if self._collision_counter >= self.collision_confirm_steps:
-            rospy.loginfo("Collision confirmed at step %d", self.episode_length)
-            reward -= 20.0; done = True
-        elif np.linalg.norm(obs[:2] - self.waypoint) < self.goal_threshold:
-            rospy.loginfo("Waypoint reached at step %d", self.episode_length)
-            done = True
+        # Reset waypoints
+        self.waypoint = [[-2.737936, 8.929284], [4.558541, 9.021430],[8.009294, 7.972296], [6.511956, 6.144635], [8.442575, 4.045553], [6.313862, 2.227839], [9.039780, -5.957927], [1.315660, -8.974951], [-6.588877, -9.004139], [-8.894380, -5.594486], [-6.242726, -1.863769], [-2.014763, -3.952699], [2.206598, -0.400605], [-0.313865, 1.972752], [-6.928076, 2.018310], [-8.195169, 8.364141]]
 
-        self.last_odom = self.odom.copy()
-        return obs, reward, done, False, {}
+        # Reset waypoint last reward
+        self.last_waypoint_reward = 0
 
-if __name__ == '__main__':
-    rospy.init_node('sac_single_waypoint')
-    env = Monitor(WaypointEnv(), filename=None, allow_early_resets=True)
+        # Reset odom info
+        self.last_odom = [self.initial_state.pose.position.x, self.initial_state.pose.position.y]
+        self.last_moved_position = self.last_odom
+
+        # Reset collision counter
+        self._collision_counter = 0
+        self.last_moved_time = time.time()
+
+        # Publish reward and reset the episode reward value
+        self.episode_reward_pub.publish(self.episode_reward)
+        self.episode_reward = 0.0
+
+        # Reset sum of angular velocity and reward times
+        self.angular_velocity_sum = 0.0
+        
+
+        # wait for valid odom
+        while self.odom is None:
+            rospy.sleep(0.01)
+
+        return self._get_obs(), {}
+
+
+if __name__ == "__main__":
+    rospy.loginfo("Starting RL Training...")
+    rospy.init_node("rl_training")
+
+    env = TrainingEnv()
+    check_env(env, warn=True)
+
     model = SAC(
-        'MlpPolicy', env,
-        buffer_size=500_000,
-        learning_starts=5_000,
-        batch_size=256,
-        train_freq=1,
-        gradient_steps=8,
-        tau=0.005,
-        ent_coef=0.01,
-        learning_rate=5e-4,
+        "MultiInputPolicy",
+        env,
+        buffer_size=50000,
         verbose=1,
-        tensorboard_log='./sac_logs/'
     )
-    model.learn(total_timesteps=500_000)
-    model.save('sac_waypoint_model')
+
+    """model_path = "rl_training_model-1746820803.zip"
+    model = SAC.load(model_path, env=env)"""
+
+    while True:
+        rospy.loginfo("Iteration starts")
+
+        model.learn(
+            total_timesteps=15000,
+            reset_num_timesteps=False,
+            tb_log_name="rl_training"
+        )
+
+        model.save(f"rl_training_model-{int(time.time())}")

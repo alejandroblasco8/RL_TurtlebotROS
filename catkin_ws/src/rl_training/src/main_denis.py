@@ -15,15 +15,12 @@ import cv2
 import rospy
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
-from sensor_msgs.msg import LaserScan, Image
+from sensor_msgs.msg import LaserScan
 from gazebo_msgs.msg import ModelState
 from gazebo_msgs.srv import GetModelState, SetModelState
 from std_srvs.srv import Empty
 
 from std_msgs.msg import Float32, Int32
-
-from extractor import LidarImageExtractor
-
 
 class TrainingEnv(gym.Env):
     def __init__(self):
@@ -45,12 +42,6 @@ class TrainingEnv(gym.Env):
                 shape=(self.num_sectors,),
                 dtype=np.float32
             ),
-            "image": gym.spaces.Box(
-                low=0,
-                high=255,
-                shape=(1, 64, 64),
-                dtype=np.uint8
-            ),
             "odom": gym.spaces.Box(
                 low=np.array([-np.inf, -np.inf, -math.pi], dtype=np.float32),
                 high=np.array([ np.inf,  np.inf,  math.pi], dtype=np.float32),
@@ -59,7 +50,6 @@ class TrainingEnv(gym.Env):
             )
         })
 
-        self.image = np.zeros((1, 64, 64), dtype=np.uint8)
         self.lidar = np.zeros(360, dtype=np.float32)
 
         # Initial state: Position
@@ -91,11 +81,24 @@ class TrainingEnv(gym.Env):
         # Confirm collision number
         self.collision_confirm_steps = 3
 
-        #Waypoint threshold
+        # LiDAR threshold
+        self.lidar_threshold = 0.7
+
+        # Dist left and right
+        self.lidar_left = 10
+        self.lidar_right= 10
+
+        # Waypoint threshold
         self.goal_threshold = 0.5
 
-        #Waypoints
-        self.waypoint = [[8.009294, 7.972296], [6.511956, 6.144635], [6.313862, 2.227839], [9.039780, -5.957927], [1.315660, -8.974951]]
+        # Dist waypoint threshold
+        self.dist_epsilon = 0.5
+
+        # Last waypoint reward
+        self.last_waypoint_reward = 0
+
+        # Waypoints
+        self.waypoint = [[-2.737936, 8.929284], [4.558541, 9.021430],[8.009294, 7.972296], [6.511956, 6.144635], [8.442575, 4.045553], [6.313862, 2.227839], [9.039780, -5.957927], [1.315660, -8.974951], [-6.588877, -9.004139], [-8.894380, -5.594486], [-6.242726, -1.863769], [-2.014763, -3.952699], [2.206598, -0.400605], [-0.313865, 1.972752], [-6.928076, 2.018310], [-8.195169, 8.364141]]
 
         # ROS Movement Publisher
         self.pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
@@ -107,15 +110,9 @@ class TrainingEnv(gym.Env):
         # ROS Odometry Subscriber
         rospy.Subscriber('/odom', Odometry, self._odom_callback)
 
-        # ROS Image Subscriber
-        rospy.Subscriber("/camera/rgb/image_raw", Image, self._image_callback)
-
         # Reward publisher
         self.episode_reward_pub = rospy.Publisher('/rl/episode_reward', Float32, queue_size=1)
         self.episode_reward = 0.0
-
-        # CV2 bridge
-        self.bridge = CvBridge()
 
         # Distance travelled threshold to get reward
         self.distance_travelled_threshold = 0.5
@@ -130,12 +127,9 @@ class TrainingEnv(gym.Env):
         # Sum of angular velocity
         self.angular_velocity_sum = 0.0
 
-    def _image_callback(self, img):
-        cv_image = self.bridge.imgmsg_to_cv2(img, desired_encoding="bgr8")
-        resized_image = cv2.resize(cv_image, (64, 64))
-        gray_image = cv2.cvtColor(resized_image, cv2.COLOR_BGR2GRAY)
-
-        self.image = np.expand_dims(gray_image, axis=0).astype(np.uint8)
+        # Collision timer
+        self.last_moved_time = time.time()
+        self.last_moved_position = None
 
     def _laser_callback(self, msg):
         # filter invalid
@@ -144,6 +138,23 @@ class TrainingEnv(gym.Env):
         # sectorize
         sectors = np.array_split(raw, self.num_sectors)
         self.lidar = np.array([np.min(s) for s in sectors], dtype=np.float32)
+        self.lidar_left, self.lidar_right = self.get_dist(raw)
+
+    def get_dist(self, raw):
+        N = len(raw)
+        deg2idx = lambda deg: int(deg * N / 360.0)
+
+        li, lf = deg2idx(70),  deg2idx(110)
+        ri, rf = deg2idx(250), deg2idx(290)
+
+        left_vals  = raw[li: lf+1]
+        right_vals = raw[ri: rf+1]
+
+        lidar_left  = float(np.max(left_vals))   if left_vals.size  > 0 else float('inf')
+        lidar_right = float(np.max(right_vals))  if right_vals.size > 0 else float('inf')
+
+        return lidar_left, lidar_right
+        
     
     def _odom_callback(self, msg):
         p = msg.pose.pose.position
@@ -154,18 +165,20 @@ class TrainingEnv(gym.Env):
         self.odom = np.array([p.x, p.y, yaw], dtype=np.float32)
 
     def _has_collisioned(self):
-        if np.min(self.lidar) <= self.collision_threshold:
-            self._collision_counter += 1
-        else:
-            self._collision_counter = 0
-        if self._collision_counter >= self.collision_confirm_steps:
-            return True
+        if self.odom is not None and self.last_moved_position is not None:
+            dist = np.linalg.norm(self.odom[:2] - self.last_moved_position)
+            if dist > 0.05:
+                self.last_moved_time = time.time()
+                self.last_moved_position = self.odom[:2]
+            else:
+                if time.time() - self.last_moved_time > 3.0:
+                    rospy.loginfo("Last_moved_pos = " + str(self.last_moved_position) + ", Actual pos = " + str(self.odom[:2]))
+                    return True
         return False
 
     def _get_obs(self):
         return {
             "lidar": self.lidar.copy(),
-            "image": self.image.copy(),
             "odom" : self.odom.copy()
         }
 
@@ -181,7 +194,7 @@ class TrainingEnv(gym.Env):
             # Stop the robot before resetting
             self.pub.publish(Twist())
 
-            reward = -200
+            reward = -300
 
             return obvs, reward, True, False, info
         
@@ -189,43 +202,52 @@ class TrainingEnv(gym.Env):
         # Get velocity from the action
         linear_velocity, angular_velocity = action
 
-        # Positive reward for moving
-        linear_reward = 30 * linear_velocity
-        reward = linear_reward
-        rospy.loginfo("Nuevo reward info")
+        
+        if(self.lidar_left == 10.0 and self.lidar_right == 10.0):
+            reward = -50
+        else:
+            dist_diff = abs(self.lidar_left - self.lidar_right)
+            reward = -dist_diff*2.5
 
-        rospy.loginfo("Linear_reward = " + str(linear_reward))
+        rospy.loginfo("Dist_reward = " + str(reward))
+        rospy.loginfo("Distancias: " + str(self.lidar_left) + "," + str(self.lidar_right))
 
         # Penalize angular velocity
-        angular_penalty = -15 * abs(angular_velocity)
+        angular_penalty = -10 * abs(angular_velocity)
         reward += angular_penalty
 
         rospy.loginfo("Angular penalty = " + str(angular_penalty))
 
-        """aprox_distance_pen = sum(map(lambda x: x < 0.4, self.lidar))
-        reward -= aprox_distance_pen * 10"""
-
         # Calculate distance traveled since last reward
         if self.odom is not None:
             euclidean = math.sqrt(
-                (self.odom[0] - self.last_odom[0]) ** 2
-                + (self.odom[1] - self.last_odom[1]) ** 2
+            (self.odom[0] - self.last_odom[0]) ** 2
+            + (self.odom[1] - self.last_odom[1]) ** 2
             )
 
             # Give reward for travelled distance
-            travelled_reward = euclidean * 10
+            travelled_reward = euclidean * 20
             reward += travelled_reward
             rospy.loginfo("travelled_reward = " + str(travelled_reward))
+            first_wp = np.array(self.waypoint[0], dtype=np.float32)
+            last_wp = np.array(self.waypoint[-1], dtype=np.float32)
+            dist_first = np.linalg.norm(self.odom[:2] - first_wp)
+            dist_last = np.linalg.norm(self.odom[:2] - last_wp)
+            k_fl = 0.5
+            """if dist_first < dist_last:
+                lr_reward = k_fl * dist_last
+            else:
+                lr_reward = -k_fl * dist_first
+            reward += lr_reward
+            rospy.loginfo(f"First vs Last WP reward: {lr_reward:.2f}")"""
 
             # Give reward for getting closer to the waypoint
-            waypoint_distance = np.linalg.norm(self.odom[:2] - self.waypoint[0])
-            if waypoint_distance < self.goal_threshold:
-                waypoint_reward = 100
+            waypoint_reward = 1/(dist_first + self.dist_epsilon) * 10 + self.last_waypoint_reward
+            if dist_first < self.goal_threshold:
                 wp = self.waypoint.pop(0)
                 self.waypoint.append(wp)
-            else:
-                waypoint_reward = -0.5 * waypoint_distance
-            
+                self.last_waypoint_reward = waypoint_reward
+
             reward += waypoint_reward
 
             rospy.loginfo("waypoint_reward = " + str(waypoint_reward))
@@ -273,13 +295,20 @@ class TrainingEnv(gym.Env):
 
         # zero lidar and image
         self.lidar = np.zeros(self.num_sectors, dtype=np.float32)
-        self.image = np.zeros((1,64,64), dtype=np.uint8)
+
+        # Reset waypoints
+        self.waypoint = [[-2.737936, 8.929284], [4.558541, 9.021430],[8.009294, 7.972296], [6.511956, 6.144635], [8.442575, 4.045553], [6.313862, 2.227839], [9.039780, -5.957927], [1.315660, -8.974951], [-6.588877, -9.004139], [-8.894380, -5.594486], [-6.242726, -1.863769], [-2.014763, -3.952699], [2.206598, -0.400605], [-0.313865, 1.972752], [-6.928076, 2.018310], [-8.195169, 8.364141]]
+
+        # Reset waypoint last reward
+        self.last_waypoint_reward = 0
 
         # Reset odom info
         self.last_odom = [self.initial_state.pose.position.x, self.initial_state.pose.position.y]
+        self.last_moved_position = self.last_odom
 
         # Reset collision counter
         self._collision_counter = 0
+        self.last_moved_time = time.time()
 
         # Publish reward and reset the episode reward value
         self.episode_reward_pub.publish(self.episode_reward)
@@ -307,19 +336,17 @@ if __name__ == "__main__":
         "MultiInputPolicy",
         env,
         buffer_size=50000,
-        policy_kwargs=dict(
-            features_extractor_class=LidarImageExtractor,
-            features_extractor_kwargs=dict(features_dim=256),
-            net_arch=[256, 256]
-        ),
         verbose=1,
     )
+
+    """model_path = "rl_training_model-1746820803.zip"
+    model = SAC.load(model_path, env=env)"""
 
     while True:
         rospy.loginfo("Iteration starts")
 
         model.learn(
-            total_timesteps=10_000,
+            total_timesteps=15000,
             reset_num_timesteps=False,
             tb_log_name="rl_training"
         )
