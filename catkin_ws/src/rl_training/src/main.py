@@ -89,7 +89,7 @@ class TrainingEnv(gym.Env):
         self.lidar_right= 10
 
         # Waypoint threshold
-        self.goal_threshold = 0.5
+        self.goal_threshold = 1.5
 
         # Dist waypoint threshold
         self.dist_epsilon = 0.5
@@ -98,7 +98,13 @@ class TrainingEnv(gym.Env):
         self.last_waypoint_reward = 0
 
         # Waypoints
-        self.waypoint = [[-2.737936, 8.929284], [4.558541, 9.021430],[8.009294, 7.972296], [6.511956, 6.144635], [8.442575, 4.045553], [6.313862, 2.227839], [9.039780, -5.957927], [1.315660, -8.974951], [-6.588877, -9.004139], [-8.894380, -5.594486], [-6.242726, -1.863769], [-2.014763, -3.952699], [2.206598, -0.400605], [-0.313865, 1.972752], [-6.928076, 2.018310], [-8.195169, 8.364141]]
+        self.waypoint = [[-2.737936, 8.929284], [4.558541, 9.021430],[7.752216, 7.972296], [7.027048, 7.027048], [7.703240, 4.045793], [7.167124, 2.227963], [9.039780, -5.957927], [1.315660, -8.974951], [-6.588877, -9.004139], [-8.894380, -5.594486], [-6.242726, -1.863769], [-2.014763, -3.952699], [2.206598, -0.400605], [-0.313865, 1.972752], [-6.928076, 2.018310], [-8.195169, 8.364141], [-2.737936, 8.929284]]
+
+        # Waypoint counter
+        self.waypoint_counter = 0
+
+        # Waypoint last dist
+        self.last_dist_first = 99999
 
         # ROS Movement Publisher
         self.pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
@@ -132,12 +138,27 @@ class TrainingEnv(gym.Env):
         self.last_moved_position = None
 
     def _laser_callback(self, msg):
-        # filter invalid
+        # Filter invalid values
         raw = np.array([r if (not math.isinf(r) and not math.isnan(r) and r<3.5) else 10.0 for r in msg.ranges], dtype=np.float32)
         self.raw_scan = raw
-        # sectorize
-        sectors = np.array_split(raw, self.num_sectors)
+        
+        # Get only data from [250º, 360º] U [0º, 110º]
+        # Create array to hold the front-facing data
+        front_data = np.zeros(220, dtype=np.float32)
+        
+        # Copy the data from [250º, 360º] - this corresponds to indices 250 to 359
+        front_data[:110] = raw[250:]
+        
+        # Copy the data from [0º, 110º] - this corresponds to indices 0 to 109
+        front_data[110:] = raw[:110]
+        
+        # Split the front-facing data into 8 equal sectors
+        sectors = np.array_split(front_data, self.num_sectors)
+        
+        # Take the minimum distance in each sector (closest obstacle)
         self.lidar = np.array([np.min(s) for s in sectors], dtype=np.float32)
+        
+        # Update left and right distances
         self.lidar_left, self.lidar_right = self.get_dist(raw)
 
     def get_dist(self, raw):
@@ -197,6 +218,11 @@ class TrainingEnv(gym.Env):
             reward = -300
 
             return obvs, reward, True, False, info
+
+        if self.waypoint_counter == len(self.waypoint):
+            self.pub.publish(Twist())
+            reward = 5000
+            return obvs, reward, True, False, info
         
 
         # Get velocity from the action
@@ -212,6 +238,10 @@ class TrainingEnv(gym.Env):
         rospy.loginfo("Dist_reward = " + str(reward))
         rospy.loginfo("Distancias: " + str(self.lidar_left) + "," + str(self.lidar_right))
 
+        # Linear reward
+        linear_reward = 30 * linear_velocity
+        reward += linear_reward
+
         # Penalize angular velocity
         angular_penalty = -10 * abs(angular_velocity)
         reward += angular_penalty
@@ -220,36 +250,25 @@ class TrainingEnv(gym.Env):
 
         # Calculate distance traveled since last reward
         if self.odom is not None:
-            euclidean = math.sqrt(
-            (self.odom[0] - self.last_odom[0]) ** 2
-            + (self.odom[1] - self.last_odom[1]) ** 2
-            )
-
-            # Give reward for travelled distance
-            travelled_reward = euclidean * 20
-            reward += travelled_reward
-            rospy.loginfo("travelled_reward = " + str(travelled_reward))
             first_wp = np.array(self.waypoint[0], dtype=np.float32)
-            last_wp = np.array(self.waypoint[-1], dtype=np.float32)
             dist_first = np.linalg.norm(self.odom[:2] - first_wp)
-            dist_last = np.linalg.norm(self.odom[:2] - last_wp)
-            k_fl = 0.5
-            """if dist_first < dist_last:
-                lr_reward = k_fl * dist_last
-            else:
-                lr_reward = -k_fl * dist_first
-            reward += lr_reward
-            rospy.loginfo(f"First vs Last WP reward: {lr_reward:.2f}")"""
-
             # Give reward for getting closer to the waypoint
             waypoint_reward = 1/(dist_first + self.dist_epsilon) * 10 + self.last_waypoint_reward
             if dist_first < self.goal_threshold:
                 wp = self.waypoint.pop(0)
                 self.waypoint.append(wp)
                 self.last_waypoint_reward = waypoint_reward
+                self.waypoint_counter += 1
+                self.last_dist_first = 99999
+
+            elif dist_first > self.last_dist_first:
+                waypoint_reward = 0
 
             reward += waypoint_reward
-
+            self.last_dist_first = dist_first
+            
+            rospy.loginfo("Distancia waypoint = " + str(dist_first))
+            rospy.loginfo("Waypoint actual = " + str(self.waypoint_counter))
             rospy.loginfo("waypoint_reward = " + str(waypoint_reward))
 
             # Reset step pose
@@ -302,6 +321,12 @@ class TrainingEnv(gym.Env):
         # Reset waypoint last reward
         self.last_waypoint_reward = 0
 
+        # Reset waypoint counter
+        self.waypoint_counter = 0
+
+        # Reset waypoint last dist
+        self.last_dist_first = 99999
+
         # Reset odom info
         self.last_odom = [self.initial_state.pose.position.x, self.initial_state.pose.position.y]
         self.last_moved_position = self.last_odom
@@ -332,23 +357,23 @@ if __name__ == "__main__":
     env = TrainingEnv()
     check_env(env, warn=True)
 
-    model = SAC(
+    """model = SAC(
         "MultiInputPolicy",
         env,
-        buffer_size=50000,
+        buffer_size=700_000,
         verbose=1,
-    )
+    )"""
 
-    """model_path = "rl_training_model-1746820803.zip"
-    model = SAC.load(model_path, env=env)"""
+    model_path = "bestModel.zip"
+    model = SAC.load(model_path, env=env)
 
     while True:
         rospy.loginfo("Iteration starts")
 
         model.learn(
-            total_timesteps=15000,
+            total_timesteps=100_000,
             reset_num_timesteps=False,
             tb_log_name="rl_training"
         )
 
-        model.save(f"rl_training_model-{int(time.time())}")
+        model.save("rl_training_model")
