@@ -364,7 +364,7 @@ if __name__ == "__main__":
         verbose=1,
     )"""
 
-    model_path = "bestModel.zip"
+    model_path = "ModeloAEntregar.zip"
     model = SAC.load(model_path, env=env)
 
     while True:
