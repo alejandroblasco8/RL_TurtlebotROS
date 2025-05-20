@@ -4,6 +4,7 @@ import math
 import time
 
 import numpy as np
+import torch
 
 import gymnasium as gym
 from stable_baselines3 import SAC
@@ -219,7 +220,7 @@ class TrainingEnv(gym.Env):
 
             return obvs, reward, True, False, info
 
-        if self.waypoint_counter == len(self.waypoint):
+        if self.waypoint_counter == len(self.waypoint) + 1:
             self.pub.publish(Twist())
             reward = 5000
             return obvs, reward, True, False, info
@@ -364,8 +365,9 @@ if __name__ == "__main__":
         verbose=1,
     )"""
 
-    model_path = "ModeloAEntregar.zip"
+    model_path = "rl_training_model.zip"
     model = SAC.load(model_path, env=env)
+    model.ent_coef = 0.01
 
     while True:
         rospy.loginfo("Iteration starts")
