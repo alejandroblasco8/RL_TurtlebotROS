@@ -25,7 +25,7 @@ if __name__ == "__main__":
         verbose=1,
     )
 
-    load_policy_from_zip("rl_training_model.zip", model)
+    load_policy_from_zip("ModeloAEntregar.zip", model)
 
     num_episodes = 1
     for ep in range(num_episodes):

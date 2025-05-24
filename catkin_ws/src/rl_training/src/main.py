@@ -4,14 +4,10 @@ import math
 import time
 
 import numpy as np
-import torch
 
 import gymnasium as gym
 from stable_baselines3 import SAC
 from stable_baselines3.common.env_checker import check_env
-
-from cv_bridge import CvBridge
-import cv2
 
 import rospy
 from nav_msgs.msg import Odometry
@@ -21,7 +17,7 @@ from gazebo_msgs.msg import ModelState
 from gazebo_msgs.srv import GetModelState, SetModelState
 from std_srvs.srv import Empty
 
-from std_msgs.msg import Float32, Int32
+from std_msgs.msg import Float32
 
 class TrainingEnv(gym.Env):
     def __init__(self):
@@ -144,22 +140,14 @@ class TrainingEnv(gym.Env):
         self.raw_scan = raw
         
         # Get only data from [250º, 360º] U [0º, 110º]
-        # Create array to hold the front-facing data
         front_data = np.zeros(220, dtype=np.float32)
-        
-        # Copy the data from [250º, 360º] - this corresponds to indices 250 to 359
         front_data[:110] = raw[250:]
-        
-        # Copy the data from [0º, 110º] - this corresponds to indices 0 to 109
         front_data[110:] = raw[:110]
         
-        # Split the front-facing data into 8 equal sectors
         sectors = np.array_split(front_data, self.num_sectors)
         
-        # Take the minimum distance in each sector (closest obstacle)
         self.lidar = np.array([np.min(s) for s in sectors], dtype=np.float32)
         
-        # Update left and right distances
         self.lidar_left, self.lidar_right = self.get_dist(raw)
 
     def get_dist(self, raw):
@@ -357,17 +345,13 @@ if __name__ == "__main__":
 
     env = TrainingEnv()
     check_env(env, warn=True)
-
-    """model = SAC(
+    
+    model = SAC(
         "MultiInputPolicy",
         env,
         buffer_size=700_000,
         verbose=1,
-    )"""
-
-    model_path = "rl_training_model.zip"
-    model = SAC.load(model_path, env=env)
-    model.ent_coef = 0.01
+    )
 
     while True:
         rospy.loginfo("Iteration starts")
